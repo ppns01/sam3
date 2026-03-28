@@ -432,17 +432,25 @@ def main():
     query_crop_path = os.path.join(args.capture_dir, 'calib_prep', 'query_crop.png')
     query_mask_path = os.path.join(args.capture_dir, 'calib_prep', 'query_mask.png')
     query_depth_path = os.path.join(args.capture_dir, 'calib_prep', 'query_depth_crop.npy')
-    scale_json_path = os.path.join(args.capture_dir, 'anisotropic_scale_hypothesis', 'anisotropic_scale_hypothesis_init.json')
+    scale_json_path = os.path.join(args.capture_dir, 'anisotropic_scale_hypothesis', 'summary.json')
     for p in [summary_path, calib_json_path, query_crop_path, query_mask_path, query_depth_path, scale_json_path, args.mesh]:
         if not os.path.exists(p):
             raise FileNotFoundError(p)
 
     out_dir = os.path.join(args.capture_dir, 'teacher_refine_v4')
     os.makedirs(out_dir, exist_ok=True)
-
     step7 = load_json(summary_path)
     calib = load_json(calib_json_path)
     scale_init = load_json(scale_json_path)
+
+    mesh_path = os.path.abspath(args.mesh)
+    mesh_entries = scale_init.get('meshes', [])
+    mesh_entry = next(
+        (m for m in mesh_entries if os.path.abspath(m['mesh_path']) == mesh_path),
+        None,
+    )
+    if mesh_entry is None:
+        raise RuntimeError(f"[ERROR] selected mesh_path not found in step6 summary: {mesh_path}")
 
     query_rgb = load_color_rgb(query_crop_path)
     query_rgb_bgr = cv2.cvtColor(query_rgb, cv2.COLOR_RGB2BGR)
@@ -450,9 +458,13 @@ def main():
     query_depth = load_depth(query_depth_path)
     Kc = load_intrinsics_json_from_dict(calib['intrinsics_crop'])
 
-    U = np.asarray(scale_init['mesh_pca_stats']['pca_basis_3x3'], dtype=np.float64)
-    center_raw_m = np.asarray(calib['mesh_bbox_center_m'], dtype=np.float64)
-    unit_scale = 1.0 if args.mesh_unit == 'm' else 0.001
+    center_raw_m = np.asarray(
+        mesh_entry.get('mesh_bbox_center_m', mesh_entry['mesh_pca_stats']['center_xyz']),
+        dtype=np.float64,
+    )
+    U = np.asarray(mesh_entry['mesh_pca_stats']['pca_basis_3x3'], dtype=np.float64)
+    unit_scale = float(mesh_entry.get('mesh_unit_scale_to_meter', 1.0))
+
 
     renderer = NvdiffrastRenderer(args.mesh, device=args.device)
     extractor = DinoV3Extractor(model_name=args.model_name, device=args.device, dtype=args.dtype)
