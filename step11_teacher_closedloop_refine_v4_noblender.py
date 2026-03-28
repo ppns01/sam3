@@ -707,7 +707,7 @@ def main():
     summary_out = {
         'capture_dir': os.path.abspath(args.capture_dir),
         'mesh_path': os.path.abspath(args.mesh),
-        'mesh_unit': args.mesh_unit,
+        'mesh_unit_scale_to_meter': float(mesh_entry.get('mesh_unit_scale_to_meter', 1.0)),
         'dino': {
             'model_name': args.model_name,
             'device': args.device,
