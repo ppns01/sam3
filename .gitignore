@@ -147,7 +147,20 @@ tensorboard/
 # OS specific
 .DS_Store
 Thumbs.db
+capture/
+captures/
+checkpoints/
+pipeline_runs/
+results/
+save/
+__pycache__/
 
+*.glb
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
 # BPE vocabulary files
 *.bpe
 *.vocab
