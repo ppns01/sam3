@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import json
 import argparse
-from typing import Dict
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -35,6 +35,43 @@ def load_xyz_npy(path: str) -> torch.Tensor:
     if arr.ndim != 3 or arr.shape[-1] != 3:
         raise ValueError(f'xyz map must be [H,W,3], got {arr.shape} @ {path}')
     return torch.from_numpy(arr)
+def rotmat_to_r6d(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+    return np.concatenate([R[:, 0], R[:, 1]], axis=0).astype(np.float32)
+
+def build_base_pose_vec(step7_info: dict) -> np.ndarray:
+    R = np.asarray(step7_info['R_3x3'], dtype=np.float32).reshape(3, 3)
+    t = np.asarray(step7_info['t_xyz_m'], dtype=np.float32).reshape(3)
+    s = np.asarray(step7_info['sx_sy_sz'], dtype=np.float32).reshape(3)
+    log_s = np.log(np.clip(s, 1e-8, None))
+    return np.concatenate([rotmat_to_r6d(R), t, log_s], axis=0).astype(np.float32)
+
+def make_v1_delta_candidates(rot_deg: float = 4.0, trans_m: float = 0.004, scale_log: float = 0.03) -> List[dict]:
+    cands = [{
+        'kind': 'base',
+        'delta_vec': np.zeros(9, dtype=np.float32),
+    }]
+
+    for axis in range(3):
+        for sign in (-1.0, 1.0):
+            d = np.zeros(9, dtype=np.float32)
+            d[axis] = np.deg2rad(sign * rot_deg)
+            cands.append({'kind': f'rot_{axis}_{sign:+.0f}', 'delta_vec': d})
+
+    for axis in range(3):
+        for sign in (-1.0, 1.0):
+            d = np.zeros(9, dtype=np.float32)
+            d[3 + axis] = sign * trans_m
+            cands.append({'kind': f'trans_{axis}_{sign:+.0f}', 'delta_vec': d})
+
+    for axis in range(3):
+        for sign in (-1.0, 1.0):
+            d = np.zeros(9, dtype=np.float32)
+            d[6 + axis] = sign * scale_log
+            cands.append({'kind': f'scale_{axis}_{sign:+.0f}', 'delta_vec': d})
+
+    return cands
+
 def sigmoid_np(x: float) -> float:
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -146,76 +183,66 @@ def main():
 
         pre_score = masked_patch_cosine_score(query_feat, anchor_feat, query_aux, anchor_aux)
 
+        step7_info = rec['rotation_info_from_step7']
+        base_pose_vec = build_base_pose_vec(step7_info)
+        proposals = make_v1_delta_candidates(rot_deg=4.0, trans_m=0.004, scale_log=0.03)
+
+        nprop = len(proposals)
+        delta_batch = torch.from_numpy(
+            np.stack([p['delta_vec'] for p in proposals], axis=0)
+        ).to(args.device)
+        base_pose_batch = torch.from_numpy(
+            np.repeat(base_pose_vec[None, :], nprop, axis=0)
+        ).to(args.device)
+
         with torch.inference_mode():
             out = model(
-                query_feat,
-                query_aux,
-                query_xyz,
-                anchor_feat,
-                anchor_aux,
-                anchor_xyz,
+                query_feat.expand(nprop, -1, -1, -1),
+                query_aux.expand(nprop, -1, -1, -1),
+                query_xyz.expand(nprop, -1, -1, -1),
+                anchor_feat.expand(nprop, -1, -1, -1),
+                anchor_aux.expand(nprop, -1, -1, -1),
+                anchor_xyz.expand(nprop, -1, -1, -1),
+                delta_batch,
+                base_pose_batch,
             )
 
-        score_logit = float(out['score_logit'].cpu()[0, 0].item())
-        delta_rvec = out['delta_rvec'].cpu()[0].numpy().tolist()
-        delta_t = out['delta_t'].cpu()[0].numpy().tolist()
-        delta_log_sxyz = out['delta_log_sxyz'].cpu()[0].numpy().tolist()
-        
-        # ---------------------------------------------------------
-        # [최적화 2] Logit을 Sigmoid 적용하여 0~1 사이의 확률값으로 저장
-        # ---------------------------------------------------------
-        uncert_logit = out['uncert_logit_map'][0, 0] # GPU에서 직접 접근
-        uncert_prob = torch.sigmoid(uncert_logit).cpu().numpy().astype(np.float32)
+        score_logits = out['score_logit'][:, 0]
+        score_probs = torch.sigmoid(score_logits)
+        best_idx = int(torch.argmax(score_logits).item())
+        best_prop = proposals[best_idx]
 
-        # 직관성을 위해 파일명 _logit -> _prob 로 변경
+        uncert_prob = torch.sigmoid(out['uncert_logit_map'][best_idx, 0]).cpu().numpy().astype(np.float32)
+
         uncert_png_path = os.path.join(out_dir, f'{stem}_uncert_prob.png')
         cv2.imwrite(uncert_png_path, (uncert_prob * 255.0).clip(0, 255).astype(np.uint8))
-        
+
         uncert_npy_path = os.path.join(out_dir, f'{stem}_uncert_prob.npy')
         np.save(uncert_npy_path, uncert_prob)
 
         pair_meta = {
             'anchor_id': anchor_id,
-            'rotation_info_from_step7': rec['rotation_info_from_step7'],
+            'rotation_info_from_step7': step7_info,
             'pre_score_masked_cosine': float(pre_score),
-            'score_logit': float(score_logit),
-            'delta_rvec': delta_rvec,
-            'delta_t': delta_t,
-            'delta_log_sxyz': delta_log_sxyz,
+            'best_kind': best_prop['kind'],
+            'best_delta_vec': best_prop['delta_vec'].tolist(),
+            'score_logit': float(score_logits[best_idx].detach().cpu().item()),
+            'score_prob': float(score_probs[best_idx].detach().cpu().item()),
             'query_xyz_path': os.path.abspath(query_xyz_path),
             'anchor_xyz_path': os.path.abspath(anchor_xyz_path),
             'uncert_prob_map_path': os.path.abspath(uncert_npy_path),
             'uncert_prob_vis_path': os.path.abspath(uncert_png_path),
+            'num_proposals': nprop,
         }
-        pair_meta['score_prob'] = float(sigmoid_np(pair_meta['score_logit']))
 
-        step7_info = pair_meta.get('rotation_info_from_step7', {})
-        pair_meta['step7_iou_filtered'] = float(step7_info.get('iou_filtered', 0.0))
-        pair_meta['step7_score'] = float(step7_info.get('score', 0.0))
-
-        pair_meta['hybrid_score'] = compute_hybrid_score(
-            pair_meta,
-            w_score=float(args.w_score),
-            w_pre=float(args.w_pre),
-            w_iou=float(args.w_iou),
-            w_step7=float(args.w_step7),
-)
         pair_meta_path = os.path.join(out_dir, f'{stem}_forward.json')
         save_json(pair_meta_path, pair_meta)
         pair_records.append(pair_meta)
+
     if len(pair_records) == 0:
         raise RuntimeError('No anchor forward results produced.')
-
-    if args.rank_mode == 'pre':
-        pair_records = sorted(pair_records, key=lambda x: x['pre_score_masked_cosine'], reverse=True)
-        best_by = 'pre_score_masked_cosine'
-    elif args.rank_mode == 'logit':
-        pair_records = sorted(pair_records, key=lambda x: x['score_logit'], reverse=True)
-        best_by = 'score_logit'
-    else:
-        pair_records = sorted(pair_records, key=lambda x: x['hybrid_score'], reverse=True)
-        best_by = 'hybrid_score'
-
+    pair_records = sorted(pair_records, key=lambda x: x['score_logit'], reverse=True)
+    best_by = 'score_logit'
     best = pair_records[0]
     summary_out = {
         'capture_dir': os.path.abspath(args.capture_dir),
@@ -236,9 +263,8 @@ def main():
         'best_by': best_by,
         'pre_score_masked_cosine': best['pre_score_masked_cosine'],
         'score_logit': best['score_logit'],
-        'delta_rvec': best['delta_rvec'],
-        'delta_t': best['delta_t'],
-        'delta_log_sxyz': best['delta_log_sxyz'],
+        'best_kind': best['best_kind'],
+        'best_delta_vec': best['best_delta_vec'],
     })
 
 
