@@ -72,24 +72,7 @@ def make_v1_delta_candidates(rot_deg: float = 4.0, trans_m: float = 0.004, scale
 
     return cands
 
-def sigmoid_np(x: float) -> float:
-    return 1.0 / (1.0 + np.exp(-x))
 
-def compute_hybrid_score(rec: dict, w_score: float, w_pre: float, w_iou: float, w_step7: float) -> float:
-    score_prob = sigmoid_np(float(rec['score_logit']))
-    pre_score = float(rec['pre_score_masked_cosine'])
-
-    step7 = rec.get('rotation_info_from_step7', {})
-    iou_filtered = float(step7.get('iou_filtered', 0.0))
-    step7_score = float(step7.get('score', 0.0))
-
-    hybrid = (
-        w_score * score_prob +
-        w_pre   * pre_score +
-        w_iou   * iou_filtered +
-        w_step7 * step7_score
-    )
-    return float(hybrid)
 
 def main():
     ap = argparse.ArgumentParser()
