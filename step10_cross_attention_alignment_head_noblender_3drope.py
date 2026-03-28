@@ -250,13 +250,11 @@ def main():
     if len(pair_records) == 0:
         raise RuntimeError('No anchor forward results produced.')
     pair_records = sorted(pair_records, key=lambda x: x['score_logit'], reverse=True)
-    best_by = 'score_logit'
     best = pair_records[0]
     summary_out = {
         'capture_dir': os.path.abspath(args.capture_dir),
         'checkpoint': os.path.abspath(args.ckpt) if args.ckpt is not None else None,
         'rope_base': float(args.rope_base),
-        'best_by': best_by,
         'best': best,
         'pairs': pair_records,
     }
@@ -268,12 +266,12 @@ def main():
     print('  summary :', summary_out_path)
     print('  best    :', {
         'anchor_id': best['anchor_id'],
-        'best_by': best_by,
         'pre_score_masked_cosine': best['pre_score_masked_cosine'],
         'score_logit': best['score_logit'],
         'best_kind': best['best_kind'],
         'best_delta_vec': best['best_delta_vec'],
     })
+
 
 
 if __name__ == '__main__':
