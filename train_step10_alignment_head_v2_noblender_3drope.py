@@ -213,10 +213,6 @@ def confidence_loss(score_logit: torch.Tensor, teacher_conf: torch.Tensor) -> to
     return F.binary_cross_entropy_with_logits(score_logit[:, 0], target)
 
 
-def weighted_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    loss = F.smooth_l1_loss(pred, target, reduction='none').mean(dim=1)
-    return (loss * weight).mean()
-
 
 def masked_uncertainty_loss(
     uncert_logit_map: torch.Tensor,
@@ -231,9 +227,6 @@ def masked_uncertainty_loss(
     weight = uncert_valid.float().view(-1)
     return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
 
-
-def uncertainty_regularization(uncert_logit_map: torch.Tensor) -> torch.Tensor:
-    return 1e-3 * (uncert_logit_map ** 2).mean()
 
 
 def move_batch_to_device(batch: dict, device: str) -> dict:
@@ -348,8 +341,6 @@ def main():
     ap.add_argument('--num_layers', type=int, default=2)
     ap.add_argument('--rope_base', type=float, default=1000.0)
     ap.add_argument('--w_conf', type=float, default=1.0)
-    ap.add_argument('--w_rot', type=float, default=1.0)
-    ap.add_argument('--w_trans', type=float, default=0.5)
     ap.add_argument('--w_scale', type=float, default=1.0)
     ap.add_argument('--w_unc', type=float, default=0.5)
     ap.add_argument('--post_self_layers', type=int, default=1)
