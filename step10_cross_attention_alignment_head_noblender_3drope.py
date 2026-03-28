@@ -85,11 +85,7 @@ def main():
     ap.add_argument('--rope_base', type=float, default=1000.0)
     ap.add_argument('--post_self_layers', type=int, default=1)
     ap.add_argument('--post_self_dropout', type=float, default=0.0)
-    ap.add_argument('--rank_mode', choices=['pre', 'logit', 'hybrid'], default='hybrid')
-    ap.add_argument('--w_score', type=float, default=0.45)
-    ap.add_argument('--w_pre', type=float, default=0.20)
-    ap.add_argument('--w_iou', type=float, default=0.25)
-    ap.add_argument('--w_step7', type=float, default=0.10)
+
     args = ap.parse_args()
 
     refined_dir = os.path.join(args.capture_dir, 'refined_feature_pack')
