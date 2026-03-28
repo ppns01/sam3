@@ -5,7 +5,7 @@ import os
 import json
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List,Optional
 
 import numpy as np
 import torch
@@ -36,6 +36,24 @@ def load_xyz_npy(path: str) -> torch.Tensor:
     if arr.ndim != 3 or arr.shape[-1] != 3:
         raise ValueError(f'xyz map must be [H,W,3], got {arr.shape} @ {path}')
     return torch.from_numpy(arr)
+
+def rotmat_to_r6d(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+    return np.concatenate([R[:, 0], R[:, 1]], axis=0).astype(np.float32)
+
+def build_base_pose_vec(base_pose: dict) -> List[float]:
+    R = np.asarray(base_pose['R_3x3'], dtype=np.float32).reshape(3, 3)
+    t = np.asarray(base_pose['t_xyz_m'], dtype=np.float32).reshape(3)
+    s = np.asarray(base_pose['sx_sy_sz'], dtype=np.float32).reshape(3)
+    log_s = np.log(np.clip(s, 1e-8, None))
+    return np.concatenate([rotmat_to_r6d(R), t, log_s], axis=0).astype(np.float32).tolist()
+
+def build_delta_vec(proposal_delta: dict) -> List[float]:
+    delta_deg = np.asarray(proposal_delta['delta_deg_xyz'], dtype=np.float32).reshape(3)
+    delta_rad = np.deg2rad(delta_deg)
+    delta_t = np.asarray(proposal_delta['delta_t_xyz'], dtype=np.float32).reshape(3)
+    delta_log_s = np.asarray(proposal_delta['delta_log_sxyz'], dtype=np.float32).reshape(3)
+    return np.concatenate([delta_rad, delta_t, delta_log_s], axis=0).astype(np.float32).tolist()
 def axis_angle_to_matrix(rvec: torch.Tensor) -> torch.Tensor:
     theta = torch.linalg.norm(rvec, dim=1, keepdim=True).clamp_min(1e-8)
     axis = rvec / theta
@@ -73,10 +91,9 @@ class PairRecord:
     anchor_aux_path: str
     anchor_xyz_path: str
     teacher_confidence: float
-    delta_rvec: List[float]
-    delta_t: List[float]
-    delta_log_sxyz: List[float]
-    uncert_target_path: str
+    delta_vec: List[float]
+    base_pose_vec: List[float]
+    uncert_target_path: Optional[str]
     base_anchor_id: int
 
 
@@ -89,16 +106,16 @@ class AlignmentTeacherDataset3DRoPE(Dataset):
             refined_dir = os.path.join(capture_dir, 'refined_feature_pack')
             teacher_dir = os.path.join(capture_dir, 'teacher_refine_v4')
 
-            teacher_pairs_path = os.path.join(teacher_dir, 'teacher_pairs.json')
+            teacher_proposals_path = os.path.join(teacher_dir, 'teacher_proposals.json')
             refined_summary_path = os.path.join(refined_dir, 'summary.json')
             feature_summary_path = os.path.join(feature_pack_dir, 'summary.json')
             query_xyz_path = os.path.join(feature_pack_dir, 'query_xyz_map.npy')
 
-            for p in [teacher_pairs_path, refined_summary_path, feature_summary_path, query_xyz_path]:
+            for p in [teacher_proposals_path, refined_summary_path, feature_summary_path, query_xyz_path]:
                 if not os.path.exists(p):
                     raise FileNotFoundError(p)
 
-            teacher_pairs = load_json(teacher_pairs_path)['pairs']
+            teacher_proposals = load_json(teacher_proposals_path)['proposals']
             refined_summary = load_json(refined_summary_path)
             feature_summary = load_json(feature_summary_path)
 
@@ -108,18 +125,25 @@ class AlignmentTeacherDataset3DRoPE(Dataset):
             query_feat_path = os.path.join(refined_dir, 'query_refined_feat.pt')
             query_aux_path = os.path.join(feature_pack_dir, 'query_aux_maps.npz')
 
-            for pair in teacher_pairs:
-                base_anchor_id = int(pair['base_anchor_id'])
+            for proposal in teacher_proposals:
+                base_anchor_id = int(proposal['base_anchor_id'])
                 if base_anchor_id not in anchor_meta_map or base_anchor_id not in feature_anchor_map:
                     continue
 
                 anchor_meta = anchor_meta_map[base_anchor_id]
                 feature_meta = feature_anchor_map[base_anchor_id]
-                tgt = pair['teacher_target_for_step10']
+                tgt = proposal['teacher_target_for_step10']
 
                 anchor_feat_path = anchor_meta['refined_feat_path']
                 anchor_aux_path = anchor_meta['input_aux_path']
-                anchor_xyz_path = feature_meta.get('xyz_path', os.path.join(feature_pack_dir, f'cand_{base_anchor_id:04d}_xyz_map.npy'))
+                anchor_xyz_path = feature_meta.get(
+                    'xyz_path',
+                    os.path.join(feature_pack_dir, f'cand_{base_anchor_id:04d}_xyz_map.npy')
+                )
+
+                uncert_target_path = tgt.get('uncert_target_npy')
+                if uncert_target_path is not None:
+                    uncert_target_path = os.path.abspath(uncert_target_path)
 
                 rec = PairRecord(
                     capture_dir=os.path.abspath(capture_dir),
@@ -130,20 +154,18 @@ class AlignmentTeacherDataset3DRoPE(Dataset):
                     anchor_aux_path=os.path.abspath(anchor_aux_path),
                     anchor_xyz_path=os.path.abspath(anchor_xyz_path),
                     teacher_confidence=float(np.clip(tgt['teacher_confidence'], 0.0, 1.0)),
-                    delta_rvec=[float(x) for x in tgt['delta_rvec']],
-                    delta_t=[float(x) for x in tgt['delta_t']],
-                    delta_log_sxyz=[float(x) for x in tgt['delta_log_sxyz']],
-                    uncert_target_path=os.path.abspath(tgt['uncert_target_npy']),
+                    delta_vec=build_delta_vec(proposal['proposal_delta']),
+                    base_pose_vec=build_base_pose_vec(proposal['base_pose']),
+                    uncert_target_path=uncert_target_path,
                     base_anchor_id=base_anchor_id,
                 )
                 self.records.append(rec)
 
         if len(self.records) == 0:
-            raise RuntimeError('No teacher pairs found.')
+            raise RuntimeError('No teacher proposals found.')
 
     def __len__(self):
         return len(self.records)
-
     def __getitem__(self, idx: int):
         rec = self.records[idx]
         q_feat = load_pt(rec.query_feat_path).float()
@@ -154,11 +176,19 @@ class AlignmentTeacherDataset3DRoPE(Dataset):
         a_aux = build_anchor_aux_tensor(load_npz(rec.anchor_aux_path)).float()
         a_xyz = load_xyz_npy(rec.anchor_xyz_path).float()
 
-        delta_rvec = torch.tensor(rec.delta_rvec, dtype=torch.float32)
-        delta_t = torch.tensor(rec.delta_t, dtype=torch.float32)
-        delta_log_sxyz = torch.tensor(rec.delta_log_sxyz, dtype=torch.float32)
+        delta_vec = torch.tensor(rec.delta_vec, dtype=torch.float32)
+        base_pose_vec = torch.tensor(rec.base_pose_vec, dtype=torch.float32)
         teacher_conf = torch.tensor(rec.teacher_confidence, dtype=torch.float32)
-        uncert_target = torch.from_numpy(np.load(rec.uncert_target_path).astype(np.float32)).unsqueeze(0)
+
+        if rec.uncert_target_path is not None and os.path.exists(rec.uncert_target_path):
+            uncert_target = torch.from_numpy(
+                np.load(rec.uncert_target_path).astype(np.float32)
+            ).unsqueeze(0)
+            uncert_valid = torch.tensor(1.0, dtype=torch.float32)
+        else:
+            Hf, Wf = q_feat.shape[-2], q_feat.shape[-1]
+            uncert_target = torch.zeros((1, Hf, Wf), dtype=torch.float32)
+            uncert_valid = torch.tensor(0.0, dtype=torch.float32)
 
         return {
             'query_feat': q_feat,
@@ -167,14 +197,15 @@ class AlignmentTeacherDataset3DRoPE(Dataset):
             'anchor_feat': a_feat,
             'anchor_aux': a_aux,
             'anchor_xyz': a_xyz,
-            'delta_rvec': delta_rvec,
-            'delta_t': delta_t,
-            'delta_log_sxyz': delta_log_sxyz,
+            'delta_vec': delta_vec,
+            'base_pose_vec': base_pose_vec,
             'teacher_conf': teacher_conf,
             'uncert_target': uncert_target,
+            'uncert_valid': uncert_valid,
             'base_anchor_id': rec.base_anchor_id,
             'capture_dir': rec.capture_dir,
         }
+
 
 
 def confidence_loss(score_logit: torch.Tensor, teacher_conf: torch.Tensor) -> torch.Tensor:
@@ -187,8 +218,18 @@ def weighted_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weight: torch.T
     return (loss * weight).mean()
 
 
-def uncertainty_supervision_loss(uncert_logit_map: torch.Tensor, uncert_target: torch.Tensor) -> torch.Tensor:
-    return F.binary_cross_entropy_with_logits(uncert_logit_map, uncert_target)
+def masked_uncertainty_loss(
+    uncert_logit_map: torch.Tensor,
+    uncert_target: torch.Tensor,
+    uncert_valid: torch.Tensor,
+) -> torch.Tensor:
+    per_sample = F.binary_cross_entropy_with_logits(
+        uncert_logit_map,
+        uncert_target,
+        reduction='none',
+    ).mean(dim=(1, 2, 3))
+    weight = uncert_valid.float().view(-1)
+    return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 def uncertainty_regularization(uncert_logit_map: torch.Tensor) -> torch.Tensor:
@@ -208,44 +249,9 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_rot, 
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
-        out = model(
-            batch['query_feat'],
-            batch['query_aux'],
-            batch['query_xyz'],
-            batch['anchor_feat'],
-            batch['anchor_aux'],
-            batch['anchor_xyz'],
-        )
-
-        pose_weight = 0.10 + batch['teacher_conf'].clamp(0.0, 1.0)
-        loss_conf = confidence_loss(out['score_logit'], batch['teacher_conf'])
-        loss_rot = weighted_geodesic_loss(out['delta_rvec'], batch['delta_rvec'], pose_weight)
-        loss_trans = weighted_smooth_l1(out['delta_t'], batch['delta_t'], pose_weight)
-        loss_scale = weighted_smooth_l1(out['delta_log_sxyz'], batch['delta_log_sxyz'], pose_weight)
-        loss_unc = uncertainty_supervision_loss(out['uncert_logit_map'], batch['uncert_target']) + uncertainty_regularization(out['uncert_logit_map'])
-
-        loss = w_conf * loss_conf + w_rot * loss_rot + w_trans * loss_trans + w_scale * loss_scale + w_unc * loss_unc
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-
-        losses_log['total'].append(float(loss.item()))
-        losses_log['conf'].append(float(loss_conf.item()))
-        losses_log['rot'].append(float(loss_rot.item()))
-        losses_log['trans'].append(float(loss_trans.item()))
-        losses_log['scale'].append(float(loss_scale.item()))
-        losses_log['unc'].append(float(loss_unc.item()))
-
-    return {k: float(np.mean(v)) for k, v in losses_log.items()}
-
-
-@torch.no_grad()
-def eval_one_epoch(model, loader, device, w_conf, w_rot, w_trans, w_scale, w_unc):
-    model.eval()
-    losses_log = {k: [] for k in ['total', 'conf', 'rot', 'trans', 'scale', 'unc']}
+        out = model(def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
+    model.train()
+    losses_log = {k: [] for k in ['total', 'conf', 'unc']}
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -256,25 +262,67 @@ def eval_one_epoch(model, loader, device, w_conf, w_rot, w_trans, w_scale, w_unc
             batch['anchor_feat'],
             batch['anchor_aux'],
             batch['anchor_xyz'],
+            batch['delta_vec'],
+            batch['base_pose_vec'],
         )
 
-        pose_weight = 0.10 + batch['teacher_conf'].clamp(0.0, 1.0)
         loss_conf = confidence_loss(out['score_logit'], batch['teacher_conf'])
-        loss_rot = weighted_geodesic_loss(out['delta_rvec'], batch['delta_rvec'], pose_weight)
-        loss_trans = weighted_smooth_l1(out['delta_t'], batch['delta_t'], pose_weight)
-        loss_scale = weighted_smooth_l1(out['delta_log_sxyz'], batch['delta_log_sxyz'], pose_weight)
-        loss_unc = uncertainty_supervision_loss(out['uncert_logit_map'], batch['uncert_target']) + uncertainty_regularization(out['uncert_logit_map'])
+        loss_unc = masked_uncertainty_loss(
+            out['uncert_logit_map'],
+            batch['uncert_target'],
+            batch['uncert_valid'],
+        )
 
-        loss = w_conf * loss_conf + w_rot * loss_rot + w_trans * loss_trans + w_scale * loss_scale + w_unc * loss_unc
+        loss = w_conf * loss_conf + w_unc * loss_unc
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
         losses_log['total'].append(float(loss.item()))
         losses_log['conf'].append(float(loss_conf.item()))
-        losses_log['rot'].append(float(loss_rot.item()))
-        losses_log['trans'].append(float(loss_trans.item()))
-        losses_log['scale'].append(float(loss_scale.item()))
         losses_log['unc'].append(float(loss_unc.item()))
 
     return {k: float(np.mean(v)) for k, v in losses_log.items()}
+
+
+
+@torch.no_grad()
+@torch.no_grad()
+def eval_one_epoch(model, loader, device, w_conf, w_unc):
+    model.eval()
+    losses_log = {k: [] for k in ['total', 'conf', 'unc']}
+
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        out = model(
+            batch['query_feat'],
+            batch['query_aux'],
+            batch['query_xyz'],
+            batch['anchor_feat'],
+            batch['anchor_aux'],
+            batch['anchor_xyz'],
+            batch['delta_vec'],
+            batch['base_pose_vec'],
+        )
+
+        loss_conf = confidence_loss(out['score_logit'], batch['teacher_conf'])
+        loss_unc = masked_uncertainty_loss(
+            out['uncert_logit_map'],
+            batch['uncert_target'],
+            batch['uncert_valid'],
+        )
+
+        loss = w_conf * loss_conf + w_unc * loss_unc
+
+        losses_log['total'].append(float(loss.item()))
+        losses_log['conf'].append(float(loss_conf.item()))
+        losses_log['unc'].append(float(loss_unc.item()))
+
+    return {k: float(np.mean(v)) for k, v in losses_log.items()}
+
 
 
 def split_capture_dirs(capture_dirs_str: str) -> List[str]:
@@ -365,28 +413,22 @@ def main():
     history = []
     for epoch in range(int(args.epochs)):
         train_metrics = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=args.device,
-            grad_clip=float(args.grad_clip),
-            w_conf=float(args.w_conf),
-            w_rot=float(args.w_rot),
-            w_trans=float(args.w_trans),
-            w_scale=float(args.w_scale),
-            w_unc=float(args.w_unc),
-        )
+        model=model,
+        loader=train_loader,
+        optimizer=optimizer,
+        device=args.device,
+        grad_clip=float(args.grad_clip),
+        w_conf=float(args.w_conf),
+        w_unc=float(args.w_unc),
+            )
 
         if val_loader is not None:
             val_metrics = eval_one_epoch(
-                model=model,
-                loader=val_loader,
-                device=args.device,
-                w_conf=float(args.w_conf),
-                w_rot=float(args.w_rot),
-                w_trans=float(args.w_trans),
-                w_scale=float(args.w_scale),
-                w_unc=float(args.w_unc),
+            model=model,
+            loader=val_loader,
+            device=args.device,
+            w_conf=float(args.w_conf),
+            w_unc=float(args.w_unc),
             )
             score_to_track = val_metrics['total']
         else:
