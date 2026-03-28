@@ -314,9 +314,12 @@ def evaluate_state_batch(
         key = _state_cache_key(st)
 
         if key in state_cache:
-            out[i] = {**rec, **state_cache[key]}
+            cached = state_cache[key]
+            if return_dense:
+                out[i] = {**rec, **cached}
+            else:
+                out[i] = {**rec, **{k: v for k, v in cached.items() if k != 'uncert_target'}}
             continue
-
         A, b, _ = compose_affine_from_pose(st['R'], st['t'], st['s'], U, center_raw_m, unit_scale)
         A_list.append(A)
         b_list.append(b)
@@ -398,15 +401,20 @@ def evaluate_state_batch(
                 'aspect_render': scored['aspect_render'],
             }
 
-            state_cache[key] = light_score
+            cache_rec = {
+                **light_score,
+                'uncert_target': scored['uncert_target'],
+            }
+            state_cache[key] = cache_rec
+
             if return_dense:
                 out[orig_i] = {
                     **candidate_records[orig_i],
-                    **light_score,
-                    'uncert_target': scored['uncert_target'],
+                    **cache_rec,
                 }
             else:
                 out[orig_i] = {**candidate_records[orig_i], **light_score}
+
     return out
 
 
@@ -502,7 +510,8 @@ def main():
             step_trans = trans_steps_m[si]
             step_scale = scale_steps_log[si]
             for pass_idx in range(int(args.passes_per_stage)):
-                proposals = perturb_states(state, step_rot, step_trans, step_scale)
+                condition_state = make_state(state['R'], state['t'], state['s'])
+                proposals = perturb_states(condition_state, step_rot, step_trans, step_scale)
                 scored = evaluate_state_batch(
                     renderer=renderer,
                     K=Kc,
@@ -543,11 +552,15 @@ def main():
                         'kind': rec['kind'],
 
                         'base_pose': {
+                            'R_3x3': condition_state['R'].tolist(),
+                            't_xyz_m': condition_state['t'].tolist(),
+                            'sx_sy_sz': condition_state['s'].tolist(),
+                        },
+                        'root_anchor_pose': {
                             'R_3x3': R_base.tolist(),
                             't_xyz_m': t_base.tolist(),
                             'sx_sy_sz': s_base.tolist(),
                         },
-
                         'proposal_delta': {
                             'delta_deg_xyz': [float(x) for x in rec['delta_deg_xyz']],
                             'delta_t_xyz': [float(x) for x in rec['delta_t_xyz']],

@@ -85,6 +85,10 @@ def main():
     ap.add_argument('--rope_base', type=float, default=1000.0)
     ap.add_argument('--post_self_layers', type=int, default=1)
     ap.add_argument('--post_self_dropout', type=float, default=0.0)
+    ap.add_argument('--rot_deg', type=float, default=4.0)
+    ap.add_argument('--trans_mm', type=float, default=4.0)
+    ap.add_argument('--scale_log', type=float, default=0.03)
+    ap.add_argument('--save_topk', type=int, default=5)
 
     args = ap.parse_args()
 
@@ -164,7 +168,11 @@ def main():
 
         step7_info = rec['rotation_info_from_step7']
         base_pose_vec = build_base_pose_vec(step7_info)
-        proposals = make_v1_delta_candidates(rot_deg=4.0, trans_m=0.004, scale_log=0.03)
+        proposals = make_v1_delta_candidates(
+            rot_deg=float(args.rot_deg),
+            trans_m=float(args.trans_mm) * 1e-3,
+            scale_log=float(args.scale_log),
+        )
 
         nprop = len(proposals)
         delta_batch = torch.from_numpy(
@@ -188,8 +196,26 @@ def main():
 
         score_logits = out['score_logit'][:, 0]
         score_probs = torch.sigmoid(score_logits)
-        best_idx = int(torch.argmax(score_logits).item())
+
+        sorted_idx = torch.argsort(score_logits, descending=True)
+        best_idx = int(sorted_idx[0].item())
         best_prop = proposals[best_idx]
+
+        topk = []
+        for rank, idx in enumerate(sorted_idx[: max(1, int(args.save_topk))].tolist(), start=1):
+            topk.append({
+                'rank': rank,
+                'kind': proposals[idx]['kind'],
+                'delta_vec': proposals[idx]['delta_vec'].tolist(),
+                'score_logit': float(score_logits[idx].detach().cpu().item()),
+                'score_prob': float(score_probs[idx].detach().cpu().item()),
+            })
+
+        logit_gap_top1_top2 = None
+        if len(sorted_idx) > 1:
+            i0 = int(sorted_idx[0].item())
+            i1 = int(sorted_idx[1].item())
+            logit_gap_top1_top2 = float((score_logits[i0] - score_logits[i1]).detach().cpu().item())
 
         uncert_prob = torch.sigmoid(out['uncert_logit_map'][best_idx, 0]).cpu().numpy().astype(np.float32)
 
@@ -212,6 +238,9 @@ def main():
             'uncert_prob_map_path': os.path.abspath(uncert_npy_path),
             'uncert_prob_vis_path': os.path.abspath(uncert_png_path),
             'num_proposals': nprop,
+            'topk_proposals': topk,
+            'logit_gap_top1_top2': logit_gap_top1_top2,
+
         }
 
         pair_meta_path = os.path.join(out_dir, f'{stem}_forward.json')

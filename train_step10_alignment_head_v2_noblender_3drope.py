@@ -245,7 +245,8 @@ def move_batch_to_device(batch: dict, device: str) -> dict:
 
 def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
     model.train()
-    losses_log = {k: [] for k in ['total', 'conf', 'unc']}
+    loss_sums = {k: 0.0 for k in ['total', 'conf', 'unc']}
+    num_seen = 0
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -268,6 +269,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
         )
 
         loss = w_conf * loss_conf + w_unc * loss_unc
+        batch_size = int(batch['query_feat'].shape[0])
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -275,18 +277,20 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        losses_log['total'].append(float(loss.item()))
-        losses_log['conf'].append(float(loss_conf.item()))
-        losses_log['unc'].append(float(loss_unc.item()))
+        loss_sums['total'] += float(loss.item()) * batch_size
+        loss_sums['conf'] += float(loss_conf.item()) * batch_size
+        loss_sums['unc'] += float(loss_unc.item()) * batch_size
+        num_seen += batch_size
 
-    return {k: float(np.mean(v)) for k, v in losses_log.items()}
+    return {k: loss_sums[k] / max(num_seen, 1) for k in loss_sums}
 
 
 
 @torch.no_grad()
 def eval_one_epoch(model, loader, device, w_conf, w_unc):
     model.eval()
-    losses_log = {k: [] for k in ['total', 'conf', 'unc']}
+    loss_sums = {k: 0.0 for k in ['total', 'conf', 'unc']}
+    num_seen = 0
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -309,12 +313,16 @@ def eval_one_epoch(model, loader, device, w_conf, w_unc):
         )
 
         loss = w_conf * loss_conf + w_unc * loss_unc
+        batch_size = int(batch['query_feat'].shape[0])
 
-        losses_log['total'].append(float(loss.item()))
-        losses_log['conf'].append(float(loss_conf.item()))
-        losses_log['unc'].append(float(loss_unc.item()))
+        loss_sums['total'] += float(loss.item()) * batch_size
+        loss_sums['conf'] += float(loss_conf.item()) * batch_size
+        loss_sums['unc'] += float(loss_unc.item()) * batch_size
+        num_seen += batch_size
 
-    return {k: float(np.mean(v)) for k, v in losses_log.items()}
+    return {k: loss_sums[k] / max(num_seen, 1) for k in loss_sums}
+
+
 
 
 
