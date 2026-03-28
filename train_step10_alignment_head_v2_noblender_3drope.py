@@ -243,13 +243,7 @@ def move_batch_to_device(batch: dict, device: str) -> dict:
     return out
 
 
-def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_rot, w_trans, w_scale, w_unc):
-    model.train()
-    losses_log = {k: [] for k in ['total', 'conf', 'rot', 'trans', 'scale', 'unc']}
-
-    for batch in loader:
-        batch = move_batch_to_device(batch, device)
-        out = model(def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
+def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_unc):
     model.train()
     losses_log = {k: [] for k in ['total', 'conf', 'unc']}
 
@@ -289,7 +283,6 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, w_conf, w_rot, 
 
 
 
-@torch.no_grad()
 @torch.no_grad()
 def eval_one_epoch(model, loader, device, w_conf, w_unc):
     model.eval()
